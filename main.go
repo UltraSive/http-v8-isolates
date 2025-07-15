@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,13 +23,31 @@ type JSResponse struct {
 	Body    string            `json:"body"`
 }
 
+func resolvePromise(val *v8go.Value, ctx *v8go.Context) (*v8go.Value, error) {
+	if !val.IsPromise() {
+		return val, nil
+	}
+	for {
+		switch p, _ := val.AsPromise(); p.State() {
+		case v8go.Fulfilled:
+			return p.Result(), nil
+		case v8go.Rejected:
+			return nil, errors.New(p.Result().DetailString())
+		case v8go.Pending:
+			ctx.PerformMicrotaskCheckpoint() // run VM to make progress on the promise
+		default:
+			return nil, fmt.Errorf("illegal v8.Promise state")
+		}
+	}
+}
+
 func main() {
 	http.ListenAndServe(":8089", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Read request body
 		bodyBytes, _ := io.ReadAll(r.Body)
 		defer r.Body.Close()
 
-		// Convert Go headers to simple map[string]string (take first value)
+		// Convert headers to map
 		headers := make(map[string]string)
 		for k, v := range r.Header {
 			if len(v) > 0 {
@@ -50,19 +69,20 @@ func main() {
 			return
 		}
 
-		// JS script: user defines global async fetch(request)
-		// The function must return a plain object with { status, headers, body }
+		// JS script defining the global async fetch function
 		script := `
 		function fetch(request) {
-  return JSON.stringify({
-    status: 200,
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      message: "Hello from v8go fetch!",
-      method: request.method,
-      url: request.url,
-      body: request.body
-    })
+  return new Promise((resolve, reject) => {
+    resolve(JSON.stringify({
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: "Hello from v8go fetch!",
+        method: request.method,
+        url: request.url,
+        body: request.body
+      })
+    }));
   });
 }
 		`
@@ -82,31 +102,22 @@ func main() {
 			return
 		}
 
-		// Call fetch(request) and await the Promise result
+		// Call fetch(request)
 		val, err := ctx.RunScript(`fetch(request)`, "callfetch.js")
 		if err != nil {
 			http.Error(w, "Failed to call fetch: "+err.Error(), 500)
 			return
 		}
 
-		/*
-			// val is a Promise, so we await it synchronously
-			// (v8go offers Await function)
-			promise, err := val.AsPromise()
-			if err != nil {
-				http.Error(w, "Value is not a Promise: "+err.Error(), 500)
-				return
-			}
-
-			result, err := promise.Await()
-			if err != nil {
-				http.Error(w, "Failed awaiting promise: "+err.Error(), 500)
-				return
-			}*/
+		// Resolve the promise and handle the result
+		resolvedVal, err := resolvePromise(val, ctx)
+		if err != nil {
+			http.Error(w, "Error resolving promise: "+err.Error(), 500)
+			return
+		}
 
 		// Result should be an object { status, headers, body }
-		// Serialize to JSON string for parsing
-		resultJSON := val.String() //result.String()
+		resultJSON := resolvedVal.String()
 
 		// Parse JSON string in Go
 		var jsRes JSResponse
