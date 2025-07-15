@@ -1,11 +1,14 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
+	"time"
 
 	"rogchap.com/v8go"
 )
@@ -41,6 +44,45 @@ func resolvePromise(val *v8go.Value, ctx *v8go.Context) (*v8go.Value, error) {
 	}
 }
 
+func fetchScriptFromStorage(domain string) (string, error) {
+	// Split domain at the last dot
+	domainParts := strings.Split(domain, ".")
+	if len(domainParts) < 2 {
+		return "", fmt.Errorf("invalid domain format")
+	}
+
+	// Assuming the part before ".packetware.run" is the wildcard
+	wildcard := domainParts[0] // Get the second-to-last part
+	bucketPath := fmt.Sprintf("https://s3.us-central-1.wasabisys.com/isolates/%s/index.js", wildcard)
+
+	// Create a custom HTTP client with InsecureSkipVerify
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true, // Bypass certificate verification
+			},
+		},
+		Timeout: 10 * time.Second, // Optional: Set a timeout for the HTTP request
+	}
+
+	resp, err := client.Get(bucketPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch script: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("failed to get script, status: %s", resp.Status)
+	}
+
+	scriptBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read script body: %w", err)
+	}
+
+	return string(scriptBytes), nil
+}
+
 func main() {
 	http.ListenAndServe(":8089", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Read request body
@@ -69,24 +111,13 @@ func main() {
 			return
 		}
 
-		// JS script defining the global async fetch function
-		script := `
-		function fetch(request) {
-  return new Promise((resolve, reject) => {
-    resolve(JSON.stringify({
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        message: "Hello from v8go fetch!",
-        method: request.method,
-        url: request.url,
-        body: request.body
-      })
-    }));
-  });
-}
-		`
-
+		// Extract the domain
+		domain := r.Host // or r.URL.Host for potentially ported domain using the request
+		script, err := fetchScriptFromStorage(domain)
+		if err != nil {
+			http.Error(w, "Failed to fetch script: "+err.Error(), 500)
+			return
+		}
 		iso := v8go.NewIsolate()
 		ctx := v8go.NewContext(iso)
 
