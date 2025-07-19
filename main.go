@@ -1,5 +1,10 @@
 package main
 
+// #define _GNU_SOURCE
+// #include <sys/resource.h>
+// #include <sys/time.h>
+import "C"
+
 import (
 	"crypto/tls"
 	"encoding/json"
@@ -9,6 +14,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -16,6 +22,18 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"rogchap.com/v8go"
 )
+
+func getThreadCPUTime() time.Duration {
+	var usage C.struct_rusage
+	C.getrusage(C.RUSAGE_THREAD, &usage)
+
+	user := time.Duration(usage.ru_utime.tv_sec)*time.Second +
+		time.Duration(usage.ru_utime.tv_usec)*time.Microsecond
+	sys := time.Duration(usage.ru_stime.tv_sec)*time.Second +
+		time.Duration(usage.ru_stime.tv_usec)*time.Microsecond
+
+	return user + sys
+}
 
 type JSRequest struct {
 	Method  string            `json:"method"`
@@ -150,8 +168,59 @@ func executeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	iso := v8go.NewIsolate()
 	ctx := v8go.NewContext(iso)
+
+	// Start CPU timer
+	startCPU := getThreadCPUTime()
+	cpuLimit := 10000 * time.Millisecond
+
+	// Watchdog to terminate isolate if it uses too much CPU time
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(1 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				used := getThreadCPUTime() - startCPU
+				if used > cpuLimit {
+					log.Println("CPU time limit exceeded:", used)
+					iso.TerminateExecution()
+					return
+				}
+			}
+		}
+	}()
+
+	fetchFunc := v8go.NewFunctionTemplate(iso, func(info *v8go.FunctionCallbackInfo) *v8go.Value {
+		if len(info.Args()) < 1 {
+			msg, _ := v8go.NewValue(iso, "fetch requires 1 argument")
+			iso.ThrowException(msg)
+			return nil
+		}
+
+		url := info.Args()[0].String()
+		resp, err := http.Get(url)
+		if err != nil {
+			msg, _ := v8go.NewValue(iso, err.Error())
+			iso.ThrowException(msg)
+			return nil
+		}
+		defer resp.Body.Close()
+
+		body, _ := io.ReadAll(resp.Body)
+		result, _ := v8go.NewValue(iso, string(body))
+		return result
+	})
+	ctx.Global().Set("fetch", fetchFunc.GetFunction(ctx))
+
 	if _, err := ctx.RunScript(fmt.Sprintf("var request = %s;", jsReqJSON), "inject.js"); err != nil {
 		http.Error(w, "Failed to inject request: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -162,17 +231,24 @@ func executeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	val, err := ctx.RunScript(`fetch(request)`, "callfetch.js")
+	val, err := ctx.RunScript(`handler(request)`, "handle.js")
 	if err != nil {
+		close(done)
 		http.Error(w, "Failed to call fetch: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	resolvedVal, err := resolvePromise(val, ctx)
 	if err != nil {
+		close(done)
 		http.Error(w, "Error resolving promise: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	close(done) // SUCCESS — stop the watchdog goroutine
+
+	cpuUsed := getThreadCPUTime() - startCPU
+	log.Printf("CPU time used: %s", cpuUsed)
 
 	resultJSON := resolvedVal.String()
 	var jsRes JSResponse
