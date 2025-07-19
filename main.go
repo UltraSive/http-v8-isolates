@@ -93,12 +93,14 @@ func main() {
 	r.Use(middleware.Logger)
 
 	// Health check endpoint
-	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+	r.Get("/runtime", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("OK"))
 	})
 
-	// Main handler
-	r.Post("/execute", executeHandler)
+	// Catch-all for any other routes
+	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
+		executeHandler(w, r)
+	})
 
 	// Get the port from the environment variable, default to 8089
 	port := os.Getenv("PORT")
