@@ -6,10 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 	"rogchap.com/v8go"
 )
 
@@ -84,86 +88,101 @@ func fetchScriptFromStorage(domain string) (string, error) {
 }
 
 func main() {
-	http.ListenAndServe(":8089", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Read request body
-		bodyBytes, _ := io.ReadAll(r.Body)
-		defer r.Body.Close()
+	// Create a new router
+	r := chi.NewRouter()
+	r.Use(middleware.Logger)
 
-		// Convert headers to map
-		headers := make(map[string]string)
-		for k, v := range r.Header {
-			if len(v) > 0 {
-				headers[k] = v[0]
-			}
+	// Health check endpoint
+	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("OK"))
+	})
+
+	// Main handler
+	r.Post("/execute", executeHandler)
+
+	// Get the port from the environment variable, default to 8089
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080" // Fallback if PORT is not set
+	}
+
+	// Start the HTTP server
+	log.Printf("Starting server on :%s", port)
+	if err := http.ListenAndServe(":"+port, r); err != nil {
+		log.Fatalf("Failed to start server: %v", err)
+	}
+}
+
+func executeHandler(w http.ResponseWriter, r *http.Request) {
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read request body: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer r.Body.Close()
+
+	headers := make(map[string]string)
+	for k, v := range r.Header {
+		if len(v) > 0 {
+			headers[k] = v[0]
 		}
+	}
 
-		// Build JSRequest object
-		jsReq := JSRequest{
-			Method:  r.Method,
-			URL:     r.URL.String(),
-			Headers: headers,
-			Body:    string(bodyBytes),
-		}
+	jsReq := JSRequest{
+		Method:  r.Method,
+		URL:     r.URL.String(),
+		Headers: headers,
+		Body:    string(bodyBytes),
+	}
 
-		jsReqJSON, err := json.Marshal(jsReq)
-		if err != nil {
-			http.Error(w, "Failed to marshal request: "+err.Error(), 500)
-			return
-		}
+	jsReqJSON, err := json.Marshal(jsReq)
+	if err != nil {
+		http.Error(w, "Failed to marshal request: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 
-		// Extract the domain
-		domain := r.Host // or r.URL.Host for potentially ported domain using the request
-		script, err := fetchScriptFromStorage(domain)
-		if err != nil {
-			http.Error(w, "Failed to fetch script: "+err.Error(), 500)
-			return
-		}
-		iso := v8go.NewIsolate()
-		ctx := v8go.NewContext(iso)
+	domain := r.Host
+	script, err := fetchScriptFromStorage(domain)
+	if err != nil {
+		http.Error(w, "Failed to fetch script: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 
-		// Inject `request` object in JS global scope
-		if _, err := ctx.RunScript(fmt.Sprintf("var request = %s;", jsReqJSON), "inject.js"); err != nil {
-			http.Error(w, "Failed to inject request: "+err.Error(), 500)
-			return
-		}
+	iso := v8go.NewIsolate()
+	ctx := v8go.NewContext(iso)
+	if _, err := ctx.RunScript(fmt.Sprintf("var request = %s;", jsReqJSON), "inject.js"); err != nil {
+		http.Error(w, "Failed to inject request: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 
-		// Run user JS script
-		if _, err := ctx.RunScript(script, "worker.js"); err != nil {
-			http.Error(w, "Failed to run worker script: "+err.Error(), 500)
-			return
-		}
+	if _, err := ctx.RunScript(script, "worker.js"); err != nil {
+		http.Error(w, "Failed to run worker script: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 
-		// Call fetch(request)
-		val, err := ctx.RunScript(`fetch(request)`, "callfetch.js")
-		if err != nil {
-			http.Error(w, "Failed to call fetch: "+err.Error(), 500)
-			return
-		}
+	val, err := ctx.RunScript(`fetch(request)`, "callfetch.js")
+	if err != nil {
+		http.Error(w, "Failed to call fetch: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 
-		// Resolve the promise and handle the result
-		resolvedVal, err := resolvePromise(val, ctx)
-		if err != nil {
-			http.Error(w, "Error resolving promise: "+err.Error(), 500)
-			return
-		}
+	resolvedVal, err := resolvePromise(val, ctx)
+	if err != nil {
+		http.Error(w, "Error resolving promise: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 
-		// Result should be an object { status, headers, body }
-		resultJSON := resolvedVal.String()
+	resultJSON := resolvedVal.String()
+	var jsRes JSResponse
+	if err := json.Unmarshal([]byte(resultJSON), &jsRes); err != nil {
+		http.Error(w, "Invalid JSON response from JS: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 
-		// Parse JSON string in Go
-		var jsRes JSResponse
-		if err := json.Unmarshal([]byte(resultJSON), &jsRes); err != nil {
-			http.Error(w, "Invalid JSON response from JS: "+err.Error(), 500)
-			return
-		}
+	for k, v := range jsRes.Headers {
+		w.Header().Set(k, v)
+	}
 
-		// Set response headers
-		for k, v := range jsRes.Headers {
-			w.Header().Set(k, v)
-		}
-
-		// Write status and body
-		w.WriteHeader(jsRes.Status)
-		w.Write([]byte(jsRes.Body))
-	}))
+	w.WriteHeader(jsRes.Status)
+	w.Write([]byte(jsRes.Body))
 }

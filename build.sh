@@ -1,0 +1,1 @@
+docker build -t v8go-http .

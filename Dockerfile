@@ -22,6 +22,9 @@ RUN go build -o main .
 # -------- Runtime Stage --------
 FROM debian:bookworm-slim
 
+# Set default environment variable
+ENV PORT=8080
+
 # Install V8 shared libs only (copied from build stage or system install)
 RUN apt-get update && apt-get install -y \
     libstdc++6 libnss3 libglib2.0-0 libexpat1 \
@@ -30,7 +33,7 @@ RUN apt-get update && apt-get install -y \
 # Copy binary and v8 shared libs from builder
 COPY --from=builder /app/main /app/main
 
-EXPOSE 8089
+EXPOSE 8080
 
 # Set entrypoint
 ENTRYPOINT ["/app/main"]
