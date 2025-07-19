@@ -24,6 +24,8 @@ FROM debian:bookworm-slim
 
 # Set default environment variable
 ENV PORT=8080
+ENV BUCKET_NAME=isolates
+ENV STORAGE_ENDPOINT=https://s3.us-central-1.wasabisys.com
 
 # Install V8 shared libs only (copied from build stage or system install)
 RUN apt-get update && apt-get install -y \

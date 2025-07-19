@@ -73,9 +73,13 @@ func fetchScriptFromStorage(domain string) (string, error) {
 		return "", fmt.Errorf("invalid domain format")
 	}
 
-	// Assuming the part before ".packetware.run" is the wildcard
-	wildcard := domainParts[0] // Get the second-to-last part
-	bucketPath := fmt.Sprintf("https://s3.us-central-1.wasabisys.com/isolates/%s/index.js", wildcard)
+	// Assuming the part before ".function.tld" is the wildcard
+	function := domainParts[0]                       // Get the first part
+	bucketName := os.Getenv("BUCKET_NAME")           // Fetch bucket name from environment variables
+	storageEndpoint := os.Getenv("STORAGE_ENDPOINT") // Fetch storage endpoint from environment variables
+
+	// Construct the bucket path using environment variables
+	bucketPath := fmt.Sprintf("%s/%s/%s/index.js", storageEndpoint, bucketName, function)
 
 	// Create a custom HTTP client with InsecureSkipVerify
 	client := &http.Client{
