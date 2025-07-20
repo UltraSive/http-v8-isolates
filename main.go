@@ -16,24 +16,13 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"rogchap.com/v8go"
 )
-
-func getThreadCPUTime() time.Duration {
-	var usage C.struct_rusage
-	C.getrusage(C.RUSAGE_THREAD, &usage)
-
-	user := time.Duration(usage.ru_utime.tv_sec)*time.Second +
-		time.Duration(usage.ru_utime.tv_usec)*time.Microsecond
-	sys := time.Duration(usage.ru_stime.tv_sec)*time.Second +
-		time.Duration(usage.ru_stime.tv_usec)*time.Microsecond
-
-	return user + sys
-}
 
 type JSRequest struct {
 	Method  string            `json:"method"`
@@ -46,6 +35,32 @@ type JSResponse struct {
 	Status  int               `json:"status"`
 	Headers map[string]string `json:"headers"`
 	Body    string            `json:"body"`
+}
+
+// Shared cache of script isolates
+type ScriptWorker struct {
+	iso    *v8go.Isolate
+	queue  chan func()
+	mu     sync.Mutex
+	active int // number of active concurrent users of this worker
+}
+
+var (
+	scriptWorker = make(map[string]*ScriptWorker)
+	scriptMu     sync.Mutex
+	evictionTTL  = 5 * time.Minute
+)
+
+func getThreadCPUTime() time.Duration {
+	var usage C.struct_rusage
+	C.getrusage(C.RUSAGE_THREAD, &usage)
+
+	user := time.Duration(usage.ru_utime.tv_sec)*time.Second +
+		time.Duration(usage.ru_utime.tv_usec)*time.Microsecond
+	sys := time.Duration(usage.ru_stime.tv_sec)*time.Second +
+		time.Duration(usage.ru_stime.tv_usec)*time.Microsecond
+
+	return user + sys
 }
 
 func resolvePromise(val *v8go.Value, ctx *v8go.Context) (*v8go.Value, error) {
@@ -66,15 +81,7 @@ func resolvePromise(val *v8go.Value, ctx *v8go.Context) (*v8go.Value, error) {
 	}
 }
 
-func fetchScriptFromStorage(domain string) (string, error) {
-	// Split domain at the last dot
-	domainParts := strings.Split(domain, ".")
-	if len(domainParts) < 2 {
-		return "", fmt.Errorf("invalid domain format")
-	}
-
-	// Assuming the part before ".function.tld" is the wildcard
-	function := domainParts[0]                       // Get the first part
+func fetchScriptFromStorage(function string) (string, error) {
 	bucketName := os.Getenv("BUCKET_NAME")           // Fetch bucket name from environment variables
 	storageEndpoint := os.Getenv("STORAGE_ENDPOINT") // Fetch storage endpoint from environment variables
 
@@ -137,6 +144,63 @@ func main() {
 	}
 }
 
+func getOrCreateWorker(function string) (*ScriptWorker, error) {
+	scriptMu.Lock()
+	defer scriptMu.Unlock()
+
+	if worker, exists := scriptWorker[function]; exists {
+		log.Println("Using existing worker.")
+		worker.mu.Lock()
+		worker.active++ // increment the active users
+		worker.mu.Unlock()
+		return worker, nil
+	} else {
+		log.Println("Creating new worker.")
+	}
+
+	iso := v8go.NewIsolate()
+	queue := make(chan func(), 100)
+
+	worker := &ScriptWorker{
+		iso:    iso,
+		queue:  queue,
+		active: 1, // first user
+	}
+	scriptWorker[function] = worker
+
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+
+		for job := range queue {
+			job()
+		}
+	}()
+
+	return worker, nil
+}
+
+// Call this when request finishes using the worker
+func releaseWorker(function string) {
+	scriptMu.Lock()
+	worker, exists := scriptWorker[function]
+	if !exists {
+		scriptMu.Unlock()
+		return
+	}
+	worker.mu.Lock()
+	worker.active--
+	activeCount := worker.active
+	worker.mu.Unlock()
+	if activeCount <= 0 {
+		// No more users - cleanup
+		delete(scriptWorker, function)
+		close(worker.queue)
+		worker.iso.Dispose()
+	}
+	scriptMu.Unlock()
+}
+
 func executeHandler(w http.ResponseWriter, r *http.Request) {
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -145,7 +209,7 @@ func executeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	headers := make(map[string]string)
+	headers := map[string]string{}
 	for k, v := range r.Header {
 		if len(v) > 0 {
 			headers[k] = v[0]
@@ -166,105 +230,130 @@ func executeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	domain := r.Host
-	script, err := fetchScriptFromStorage(domain)
+	// Split domain at the last dot
+	domainParts := strings.Split(domain, ".")
+	if len(domainParts) < 2 {
+		http.Error(w, "invalid domain format", http.StatusInternalServerError)
+		return
+	}
+
+	// Assuming the part before ".function.tld" is the wildcard
+	function := domainParts[0] // Get the first part
+
+	script, err := fetchScriptFromStorage(function)
 	if err != nil {
 		http.Error(w, "Failed to fetch script: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+	worker, err := getOrCreateWorker(function)
+	if err != nil {
+		http.Error(w, "Failed to get worker: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 
-	iso := v8go.NewIsolate()
-	ctx := v8go.NewContext(iso)
+	responseCh := make(chan JSResponse)
+	errorCh := make(chan error)
 
-	// Start CPU timer
-	startCPU := getThreadCPUTime()
-	cpuLimit := 10000 * time.Millisecond
+	worker.queue <- func() {
+		defer releaseWorker(function) // Decrement active count when done
 
-	// Watchdog to terminate isolate if it uses too much CPU time
-	done := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(1 * time.Millisecond)
-		defer ticker.Stop()
+		ctx := v8go.NewContext(worker.iso)
 
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				used := getThreadCPUTime() - startCPU
-				if used > cpuLimit {
-					log.Println("CPU time limit exceeded:", used)
-					iso.TerminateExecution()
+		startCPU := getThreadCPUTime()
+		cpuLimit := 10 * time.Millisecond
+		done := make(chan struct{})
+
+		go func() {
+			ticker := time.NewTicker(1 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-done:
 					return
+				case <-ticker.C:
+					if used := getThreadCPUTime() - startCPU; used > cpuLimit {
+						log.Println("CPU time limit exceeded:", used)
+						ctx.Close()
+						return
+					}
 				}
 			}
-		}
-	}()
+		}()
 
-	fetchFunc := v8go.NewFunctionTemplate(iso, func(info *v8go.FunctionCallbackInfo) *v8go.Value {
-		if len(info.Args()) < 1 {
-			msg, _ := v8go.NewValue(iso, "fetch requires 1 argument")
-			iso.ThrowException(msg)
-			return nil
+		fetchFunc := v8go.NewFunctionTemplate(worker.iso, func(info *v8go.FunctionCallbackInfo) *v8go.Value {
+			if len(info.Args()) < 1 {
+				msg, _ := v8go.NewValue(worker.iso, "fetch requires 1 argument")
+				worker.iso.ThrowException(msg)
+				return nil
+			}
+
+			url := info.Args()[0].String()
+			resp, err := http.Get(url)
+			if err != nil {
+				msg, _ := v8go.NewValue(worker.iso, err.Error())
+				worker.iso.ThrowException(msg)
+				return nil
+			}
+			defer resp.Body.Close()
+
+			body, _ := io.ReadAll(resp.Body)
+			result, _ := v8go.NewValue(worker.iso, string(body))
+			return result
+		})
+		ctx.Global().Set("fetch", fetchFunc.GetFunction(ctx))
+
+		if _, err := ctx.RunScript(fmt.Sprintf("var request = %s;", jsReqJSON), "inject.js"); err != nil {
+			close(done)
+			errorCh <- err
+			return
 		}
 
-		url := info.Args()[0].String()
-		resp, err := http.Get(url)
+		if _, err := ctx.RunScript(script, "worker.js"); err != nil {
+			close(done)
+			errorCh <- err
+			return
+		}
+
+		val, err := ctx.RunScript(`handler(request)`, "handle.js")
 		if err != nil {
-			msg, _ := v8go.NewValue(iso, err.Error())
-			iso.ThrowException(msg)
-			return nil
+			close(done)
+			errorCh <- err
+			return
 		}
-		defer resp.Body.Close()
 
-		body, _ := io.ReadAll(resp.Body)
-		result, _ := v8go.NewValue(iso, string(body))
-		return result
-	})
-	ctx.Global().Set("fetch", fetchFunc.GetFunction(ctx))
+		resolvedVal, err := resolvePromise(val, ctx)
+		if err != nil {
+			close(done)
+			errorCh <- err
+			return
+		}
 
-	if _, err := ctx.RunScript(fmt.Sprintf("var request = %s;", jsReqJSON), "inject.js"); err != nil {
-		http.Error(w, "Failed to inject request: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if _, err := ctx.RunScript(script, "worker.js"); err != nil {
-		http.Error(w, "Failed to run worker script: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	val, err := ctx.RunScript(`handler(request)`, "handle.js")
-	if err != nil {
 		close(done)
-		http.Error(w, "Failed to call fetch: "+err.Error(), http.StatusInternalServerError)
-		return
+		var jsRes JSResponse
+		if err := json.Unmarshal([]byte(resolvedVal.String()), &jsRes); err != nil {
+			errorCh <- err
+			return
+		}
+
+		responseCh <- jsRes
+
+		cpuUsed := getThreadCPUTime() - startCPU
+		log.Printf("CPU time used: %s", cpuUsed)
+
+		ctx.Close()
 	}
 
-	resolvedVal, err := resolvePromise(val, ctx)
-	if err != nil {
-		close(done)
-		http.Error(w, "Error resolving promise: "+err.Error(), http.StatusInternalServerError)
-		return
+	select {
+	case res := <-responseCh:
+		for k, v := range res.Headers {
+			w.Header().Set(k, v)
+		}
+		w.WriteHeader(res.Status)
+		w.Write([]byte(res.Body))
+	case err := <-errorCh:
+		http.Error(w, "Script error: "+err.Error(), http.StatusInternalServerError)
+	case <-time.After(2 * time.Second):
+		http.Error(w, "Script timed out", http.StatusGatewayTimeout)
 	}
-
-	close(done) // SUCCESS — stop the watchdog goroutine
-
-	cpuUsed := getThreadCPUTime() - startCPU
-	log.Printf("CPU time used: %s", cpuUsed)
-
-	resultJSON := resolvedVal.String()
-	var jsRes JSResponse
-	if err := json.Unmarshal([]byte(resultJSON), &jsRes); err != nil {
-		http.Error(w, "Invalid JSON response from JS: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	for k, v := range jsRes.Headers {
-		w.Header().Set(k, v)
-	}
-
-	w.WriteHeader(jsRes.Status)
-	w.Write([]byte(jsRes.Body))
 }
